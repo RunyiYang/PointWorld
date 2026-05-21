@@ -300,11 +300,26 @@ class TarShardWriter:
             self.tar = None
 
 
-def discover_episodes(input_root: Path, preferred_len_keys: Sequence[str]) -> List[EpisodeInfo]:
+def discover_episodes(
+    input_root: Path,
+    preferred_len_keys: Sequence[str],
+    tasks: Optional[Sequence[str]] = None,
+) -> List[EpisodeInfo]:
     if input_root.is_file():
         paths = [input_root]
     else:
-        paths = sorted(input_root.rglob("*.hdf5")) + sorted(input_root.rglob("*.h5"))
+        task_filter = [task for task in (tasks or []) if task]
+        if task_filter:
+            paths = []
+            for task in task_filter:
+                task_dir = input_root / task
+                if not task_dir.exists():
+                    _print(f"[skip] missing task directory: {task_dir}")
+                    continue
+                paths.extend(sorted(task_dir.rglob("*.hdf5")))
+                paths.extend(sorted(task_dir.rglob("*.h5")))
+        else:
+            paths = sorted(input_root.rglob("*.hdf5")) + sorted(input_root.rglob("*.h5"))
     out: List[EpisodeInfo] = []
     for path in paths:
         try:
@@ -313,7 +328,14 @@ def discover_episodes(input_root: Path, preferred_len_keys: Sequence[str]) -> Li
         except Exception as exc:
             _print(f"[skip] {path}: failed to read length: {exc}")
             continue
-        task = path.parent.name if path.parent.name else "task"
+        if input_root.is_dir():
+            try:
+                rel = path.relative_to(input_root)
+                task = rel.parts[0] if len(rel.parts) > 1 else path.parent.name
+            except ValueError:
+                task = path.parent.name if path.parent.name else "task"
+        else:
+            task = path.parent.name if path.parent.name else "task"
         episode = path.stem
         out.append(EpisodeInfo(path=path, task=task, episode=episode, length=length))
     return out
@@ -564,7 +586,7 @@ def convert(args: argparse.Namespace) -> None:
     split_dir.mkdir(parents=True, exist_ok=True)
 
     preferred_len_keys = [args.action_key, args.pointcloud_key, "/pointcloud"]
-    episodes = discover_episodes(Path(args.input_root), preferred_len_keys)
+    episodes = discover_episodes(Path(args.input_root), preferred_len_keys, args.tasks)
     if not episodes:
         raise RuntimeError(f"No readable HDF5 episodes found under {args.input_root}")
     assignment = split_episodes(episodes, args.test_ratio, args.seed, args.split_scope)
@@ -672,6 +694,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--input-root", required=True, help="RoboTwin data root or one .hdf5 file")
     p.add_argument("--output-root", required=True, help="Output WDS root")
+    p.add_argument("--tasks", nargs="+", default=None, help="Optional task directory names to include under --input-root")
     p.add_argument("--test-ratio", type=float, default=0.02)
     p.add_argument("--split-scope", choices=["task", "global"], default="task")
     p.add_argument("--seed", type=int, default=42)
