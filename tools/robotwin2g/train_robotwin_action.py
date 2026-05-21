@@ -173,7 +173,7 @@ def load_resume(
     return int(payload.get("step", 0)), int(payload.get("epoch", 0)), float(payload.get("best_metric", float("inf")))
 
 
-def make_loaders(args: argparse.Namespace, feature_dims) -> Tuple[DataLoader, DataLoader, int, int]:
+def make_loaders(args: argparse.Namespace, feature_dims) -> Tuple[DataLoader, Optional[DataLoader], int, int]:
     train_ds = RobotWinWDSDataset(
         args.wds_root,
         "train",
@@ -183,15 +183,6 @@ def make_loaders(args: argparse.Namespace, feature_dims) -> Tuple[DataLoader, Da
         target_robot_features_dim=feature_dims.robot_features_dim,
         shuffle_buffer=args.shuffle_buffer,
     )
-    test_ds = RobotWinWDSDataset(
-        args.wds_root,
-        "test",
-        shuffle=False,
-        seed=args.seed,
-        target_scene_features_dim=feature_dims.scene_features_dim,
-        target_robot_features_dim=feature_dims.robot_features_dim,
-        shuffle_buffer=0,
-    )
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
@@ -200,16 +191,33 @@ def make_loaders(args: argparse.Namespace, feature_dims) -> Tuple[DataLoader, Da
         collate_fn=robotwin_action_collate,
         persistent_workers=args.num_workers > 0,
     )
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=args.batch_size,
-        num_workers=max(0, min(args.num_workers, args.eval_num_workers)),
-        pin_memory=True,
-        collate_fn=robotwin_action_collate,
-        persistent_workers=(args.num_workers > 0 and args.eval_num_workers > 0),
-    )
+
     train_count = read_metadata_count(args.wds_root, "train")
     test_count = read_metadata_count(args.wds_root, "test")
+    test_loader: Optional[DataLoader]
+    try:
+        test_ds = RobotWinWDSDataset(
+            args.wds_root,
+            "test",
+            shuffle=False,
+            seed=args.seed,
+            target_scene_features_dim=feature_dims.scene_features_dim,
+            target_robot_features_dim=feature_dims.robot_features_dim,
+            shuffle_buffer=0,
+        )
+        test_loader = DataLoader(
+            test_ds,
+            batch_size=args.batch_size,
+            num_workers=max(0, min(args.num_workers, args.eval_num_workers)),
+            pin_memory=True,
+            collate_fn=robotwin_action_collate,
+            persistent_workers=(args.num_workers > 0 and args.eval_num_workers > 0),
+        )
+    except FileNotFoundError:
+        if not args.allow_empty_test:
+            raise
+        test_loader = None
+        test_count = 0
     return train_loader, test_loader, train_count, test_count
 
 
@@ -327,10 +335,14 @@ def train(args: argparse.Namespace) -> None:
 
             should_eval = args.eval_every > 0 and (step - last_eval >= args.eval_every)
             if should_eval:
-                metrics = evaluate(model, test_loader, device, action_mean, action_std, args.eval_batches, args.amp)
                 last_eval = step
-                metric = metrics["mae"]
-                print(f"[eval] step={step} mse={metrics['mse']:.6g} mae={metrics['mae']:.6g}", flush=True)
+                if test_loader is not None and test_count != 0:
+                    metrics = evaluate(model, test_loader, device, action_mean, action_std, args.eval_batches, args.amp)
+                    metric = metrics["mae"]
+                    print(f"[eval] step={step} mse={metrics['mse']:.6g} mae={metrics['mae']:.6g}", flush=True)
+                else:
+                    metric = float(loss.detach().cpu())
+                    print(f"[eval skipped] step={step} no test shards; using train loss={metric:.6g} for checkpoint selection", flush=True)
                 save_checkpoint(
                     Path(args.output_dir) / "checkpoint-last.pt",
                     model,
@@ -381,9 +393,14 @@ def train(args: argparse.Namespace) -> None:
                 )
                 return
 
-    metrics = evaluate(model, test_loader, device, action_mean, action_std, args.eval_batches, args.amp)
-    print(f"[final eval] mse={metrics['mse']:.6g} mae={metrics['mae']:.6g}", flush=True)
+    if test_loader is not None and test_count != 0:
+        metrics = evaluate(model, test_loader, device, action_mean, action_std, args.eval_batches, args.amp)
+        print(f"[final eval] mse={metrics['mse']:.6g} mae={metrics['mae']:.6g}", flush=True)
+    else:
+        print("[final eval skipped] no test shards", flush=True)
     save_checkpoint(Path(args.output_dir) / "checkpoint-last.pt", model, optimizer, args, step, args.num_epochs, best_metric, action_mean, action_std)
+    if not (Path(args.output_dir) / "checkpoint-best.pt").exists():
+        save_checkpoint(Path(args.output_dir) / "checkpoint-best.pt", model, optimizer, args, step, args.num_epochs, best_metric, action_mean, action_std)
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -413,6 +430,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--max-steps", type=int, default=-1)
     p.add_argument("--eval-every", type=int, default=500)
     p.add_argument("--eval-batches", type=int, default=20)
+    p.add_argument("--allow-empty-test", dest="allow_empty_test", action="store_true", default=True, help="Do not crash when the episode-level split has no test shards; useful for one-episode smoke tests.")
+    p.add_argument("--require-test", dest="allow_empty_test", action="store_false", help="Crash if the test split has no shards.")
     p.add_argument("--save-every", type=int, default=2000)
 
     p.add_argument("--lr", type=float, default=1e-4)

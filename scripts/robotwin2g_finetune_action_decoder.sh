@@ -2,9 +2,11 @@
 set -euo pipefail
 
 # Stage 1: freeze PointWorld, train only the new action decoder.
-WDS_ROOT=${WDS_ROOT:-/work/runyi_yang/FloWAM/data/robotwin2g_pointworld_wds}
-PRETRAINED=${PRETRAINED:-pretrained_checkpoints/large-droid+behavior/model-best.pt}
-OUT=${OUT:-train_logs/robotwin2g_action_decoder}
+# Usage:
+#   bash scripts/robotwin2g_finetune_action_decoder.sh WDS_ROOT PRETRAINED OUT
+WDS_ROOT=${1:-${WDS_ROOT:-/work/runyi_yang/FloWAM/data/robotwin2g_pointworld_wds}}
+PRETRAINED=${2:-${PRETRAINED:-pretrained_checkpoints/large-droid+behavior/model-best.pt}}
+OUT=${3:-${OUT:-train_logs/robotwin2g_action_decoder}}
 
 python tools/robotwin2g/train_robotwin_action.py \
   --wds-root "${WDS_ROOT}" \
