@@ -13,10 +13,15 @@ from arguments import parse_args
 from pointworld.base import BaseModel
 
 try:
-    from pointworld.checkpoint_contract import apply_model_contract_to_args, read_checkpoint_contract
+    from pointworld.checkpoint_contract import (
+        apply_model_contract_to_args,
+        read_checkpoint_contract,
+        train_domains_from_data_contract,
+    )
 except Exception:  # pragma: no cover - older checkout fallback
     apply_model_contract_to_args = None
     read_checkpoint_contract = None
+    train_domains_from_data_contract = None
 
 
 @dataclass
@@ -64,8 +69,13 @@ def build_pointworld_args(
     args._explicit_cli_dests = set()
     if checkpoint is not None and read_checkpoint_contract is not None and apply_model_contract_to_args is not None:
         try:
-            contract, _ = read_checkpoint_contract(checkpoint, context="robotwin2g action finetune checkpoint")
+            contract, data_contract = read_checkpoint_contract(checkpoint, context="robotwin2g action finetune checkpoint")
             apply_model_contract_to_args(args, contract, context="robotwin2g action finetune", explicit_cli_dests=set())
+            if train_domains_from_data_contract is not None:
+                args.domains = train_domains_from_data_contract(
+                    data_contract,
+                    context="robotwin2g action finetune checkpoint",
+                )
         except Exception as exc:
             warnings.warn(f"Could not apply PointWorld checkpoint contract; using CLI/default architecture: {exc}")
     return args
