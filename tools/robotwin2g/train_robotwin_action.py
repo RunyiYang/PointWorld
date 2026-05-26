@@ -5,12 +5,8 @@ Stage 1:
   --stage action_decoder  -> freezes PointWorld and trains only the new action head.
 
 Stage 2:
-  --stage all --resume <stage1 ckpt>  -> unfreezes PointWorld non-DINO modules
-  and continues action-loss fine-tuning with the same data.
-
-This script intentionally trains on action loss only. RoboTwin's observed
-pointcloud[t] is not guaranteed to contain persistent point identities, so scene
-flow loss is not enabled by default.
+  --stage lora --resume <stage1 ckpt> -> trains LoRA adapters in PointWorld plus
+  the 54-D action head. Scene loss can be enabled to adapt the dynamics head.
 """
 
 from __future__ import annotations
@@ -92,6 +88,70 @@ def masked_action_loss(
     return per.sum() / denom
 
 
+def _masked_scene_loss(scene_outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor], loss_type: str) -> torch.Tensor:
+    pred = scene_outputs["scene_flows"].float()[:, 1:]
+    target = batch["scene_flows"].float()[:, 1:]
+    mask = batch["scene_exists"].bool()[:, 1:]
+    if "scene_visibility" in batch:
+        mask = mask & batch["scene_visibility"].bool()[:, 1:]
+    if "scene_depth_valid_mask" in batch:
+        mask = mask & batch["scene_depth_valid_mask"].bool()[:, 1:]
+    while mask.ndim < pred.ndim:
+        mask = mask.unsqueeze(-1)
+    if loss_type == "mse":
+        per = (pred - target).pow(2)
+    elif loss_type == "l1":
+        per = (pred - target).abs()
+    elif loss_type == "smooth_l1":
+        per = F.smooth_l1_loss(pred, target, reduction="none")
+    else:
+        raise ValueError(f"Unsupported scene loss type {loss_type}")
+    per = per * mask.to(per.dtype)
+    denom = mask.to(per.dtype).sum().clamp(min=1.0) * pred.shape[-1]
+    return per.sum() / denom
+
+
+def _point_rmse_cm(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> Tuple[float, float]:
+    diff2 = (pred - target).pow(2).sum(dim=-1)
+    diff2 = diff2 * mask.to(diff2.dtype)
+    count = mask.to(diff2.dtype).sum().clamp(min=1.0)
+    rmse_m = torch.sqrt(diff2.sum() / count)
+    return float((rmse_m * 100.0).detach().cpu()), float(count.detach().cpu())
+
+
+def _select_valid_points(points: torch.Tensor, mask: torch.Tensor, max_points: int) -> torch.Tensor:
+    pts = points[mask]
+    if pts.numel() == 0:
+        return pts.reshape(0, points.shape[-1])
+    if max_points > 0 and pts.shape[0] > max_points:
+        idx = torch.linspace(0, pts.shape[0] - 1, steps=max_points, device=pts.device).long()
+        pts = pts[idx]
+    return pts.float()
+
+
+def _chamfer_cm(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    max_points: int,
+) -> Tuple[float, int]:
+    total = 0.0
+    count = 0
+    B, T = pred.shape[:2]
+    for b in range(B):
+        for t in range(T):
+            pred_pts = _select_valid_points(pred[b, t], mask[b, t], max_points)
+            tgt_pts = _select_valid_points(target[b, t], mask[b, t], max_points)
+            if pred_pts.shape[0] == 0 or tgt_pts.shape[0] == 0:
+                continue
+            d = torch.cdist(pred_pts.unsqueeze(0), tgt_pts.unsqueeze(0), p=2).squeeze(0)
+            cd_m = 0.5 * (d.min(dim=1).values.mean() + d.min(dim=0).values.mean())
+            total += float((cd_m * 100.0).detach().cpu())
+            count += 1
+    return total, count
+
+
 @torch.no_grad()
 def evaluate(
     model: PointWorldActionModel,
@@ -101,17 +161,27 @@ def evaluate(
     std: torch.Tensor,
     max_batches: int,
     amp: bool,
+    scene_metrics: bool = True,
+    scene_cd_max_points: int = 1024,
 ) -> Dict[str, float]:
     model.eval()
     total_mse = 0.0
     total_mae = 0.0
     total_count = 0.0
+    scene_rmse_weighted = 0.0
+    scene_rmse_count = 0.0
+    scene_cd_sum = 0.0
+    scene_cd_count = 0
     for i, batch in enumerate(loader):
         if max_batches > 0 and i >= max_batches:
             break
         batch = to_device(batch, device)
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16 if device.type == "cuda" else torch.float32, enabled=amp and device.type == "cuda"):
-            pred_norm = model(batch)
+            if scene_metrics:
+                pred_norm, scene_outputs = model.forward_action_and_scene(batch, training=False)
+            else:
+                pred_norm = model(batch)
+                scene_outputs = None
         pred = pred_norm.float() * std.view(1, 1, -1) + mean.view(1, 1, -1)
         target = batch["action_target"].float()
         mask = batch["action_mask"].bool()
@@ -122,9 +192,56 @@ def evaluate(
         total_mse += float(diff.pow(2).sum().item())
         total_mae += float(diff.abs().sum().item())
         total_count += float(denom.item())
+        if scene_outputs is not None:
+            scene_pred = scene_outputs["scene_flows"].float()[:, 1:]
+            scene_target = batch["scene_flows"].float()[:, 1:]
+            scene_mask = batch["scene_exists"].bool()[:, 1:]
+            if "scene_visibility" in batch:
+                scene_mask = scene_mask & batch["scene_visibility"].bool()[:, 1:]
+            if "scene_depth_valid_mask" in batch:
+                scene_mask = scene_mask & batch["scene_depth_valid_mask"].bool()[:, 1:]
+            rmse_cm, rmse_count = _point_rmse_cm(scene_pred, scene_target, scene_mask)
+            scene_rmse_weighted += rmse_cm * rmse_count
+            scene_rmse_count += rmse_count
+            cd_sum, cd_count = _chamfer_cm(scene_pred, scene_target, scene_mask, max_points=scene_cd_max_points)
+            scene_cd_sum += cd_sum
+            scene_cd_count += cd_count
     if total_count <= 0:
-        return {"mse": float("nan"), "mae": float("nan")}
-    return {"mse": total_mse / total_count, "mae": total_mae / total_count}
+        out = {"mse": float("nan"), "mae": float("nan"), "rmse": float("nan")}
+    else:
+        mse = total_mse / total_count
+        out = {"mse": mse, "mae": total_mae / total_count, "rmse": math.sqrt(max(mse, 0.0))}
+    out["scene_rmse_cm"] = scene_rmse_weighted / scene_rmse_count if scene_rmse_count > 0 else float("nan")
+    out["scene_cd_cm"] = scene_cd_sum / scene_cd_count if scene_cd_count > 0 else float("nan")
+    out["actuator_rmse"] = out["rmse"]
+    out["actuator_cd_cm"] = float("nan")
+    return out
+
+
+def write_report(path: Path, *, step: int, stage: str, metrics: Dict[str, float], actuator_note: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "step": int(step),
+        "stage": stage,
+        "metrics": metrics,
+        "actuator_note": actuator_note,
+    }
+    with open(path.with_suffix(".json"), "w") as fp:
+        json.dump(payload, fp, indent=2, sort_keys=True)
+    lines = [
+        f"# PointWorld FlowAM Report",
+        "",
+        f"stage: `{stage}`",
+        f"step: `{step}`",
+        "",
+        "| Target | RMSE ↓ | CD (cm) ↓ |",
+        "|---|---:|---:|",
+        f"| Actuator action (54-D) | {metrics.get('actuator_rmse', float('nan')):.6g} raw | N/A |",
+        f"| Scene | {metrics.get('scene_rmse_cm', float('nan')):.6g} cm | {metrics.get('scene_cd_cm', float('nan')):.6g} |",
+        "",
+        f"Actuator note: {actuator_note}",
+    ]
+    path.write_text("\n".join(lines) + "\n")
 
 
 def save_checkpoint(
@@ -238,6 +355,16 @@ def train(args: argparse.Namespace) -> None:
 
     action_mean, action_std = load_action_stats(args.wds_root, device)
     action_dim = int(action_mean.numel())
+    if action_dim <= 0:
+        raise ValueError(
+            f"Invalid action stats in {Path(args.wds_root) / 'action_stats.json'}: "
+            "mean/std must contain at least one action dimension."
+        )
+    if args.action_dim > 0 and action_dim != args.action_dim:
+        raise ValueError(
+            f"WDS action_dim={action_dim} does not match requested --action-dim={args.action_dim}. "
+            "Regenerate the data or pass the matching action dimension."
+        )
     action_horizon = int(args.clip_horizon - 1)
     state_dim = action_dim
 
@@ -265,6 +392,21 @@ def train(args: argparse.Namespace) -> None:
         decoder_layers=args.decoder_layers,
     )
 
+    if args.stage == "lora" or args.lora_rank > 0:
+        if args.lora_rank <= 0:
+            raise ValueError("--lora-rank must be > 0 for stage lora")
+        lora_names = model.enable_lora(
+            rank=args.lora_rank,
+            alpha=args.lora_alpha,
+            dropout=args.lora_dropout,
+            target_patterns=[p for p in args.lora_targets.split(",") if p],
+            exclude_patterns=[p for p in args.lora_exclude.split(",") if p],
+            include_dinov3=args.lora_include_dinov3,
+        )
+        print(f"[lora] injected {len(lora_names)} Linear adapters", flush=True)
+        if lora_names:
+            print(f"[lora] first adapters: {lora_names[:8]}", flush=True)
+
     if args.pretrained_checkpoint:
         pretrained = load_torch(args.pretrained_checkpoint, map_location="cpu")
         missing, unexpected = model.load_pointworld_checkpoint(pretrained, strict=False)
@@ -273,13 +415,22 @@ def train(args: argparse.Namespace) -> None:
     model.set_train_stage(args.stage, unfreeze_dinov3=args.unfreeze_dinov3)
     model.to(device)
 
-    # Optimizer parameter groups: action head gets --lr; PointWorld gets --world-lr in stage all.
+    # Optimizer parameter groups: action head gets --lr; PointWorld/LoRA gets --world-lr.
     if args.stage == "all":
         world_params = [p for p in model.world_model.parameters() if p.requires_grad]
         head_params = [p for p in model.action_decoder.parameters() if p.requires_grad]
         param_groups = [
             {"params": head_params, "lr": args.lr},
             {"params": world_params, "lr": args.world_lr if args.world_lr > 0 else args.lr},
+        ]
+    elif args.stage == "lora":
+        head_params = [p for p in model.action_decoder.parameters() if p.requires_grad]
+        lora_params = list(model.lora_parameters())
+        if not lora_params:
+            raise RuntimeError("stage lora selected but no trainable LoRA parameters were found")
+        param_groups = [
+            {"params": head_params, "lr": args.lr},
+            {"params": lora_params, "lr": args.world_lr if args.world_lr > 0 else args.lr},
         ]
     else:
         param_groups = [{"params": [p for p in model.parameters() if p.requires_grad], "lr": args.lr}]
@@ -315,7 +466,11 @@ def train(args: argparse.Namespace) -> None:
             batch = to_device(batch, device)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16 if device.type == "cuda" else torch.float32, enabled=args.amp and device.type == "cuda"):
-                pred_norm = model(batch)
+                if args.scene_loss_weight > 0:
+                    pred_norm, scene_outputs = model.forward_action_and_scene(batch, training=True)
+                else:
+                    pred_norm = model(batch)
+                    scene_outputs = None
                 loss = masked_action_loss(
                     pred_norm,
                     batch["action_target"].float(),
@@ -324,6 +479,11 @@ def train(args: argparse.Namespace) -> None:
                     action_std,
                     args.loss,
                 )
+                action_loss = loss
+                scene_loss = torch.zeros((), dtype=loss.dtype, device=loss.device)
+                if scene_outputs is not None:
+                    scene_loss = _masked_scene_loss(scene_outputs, batch, args.scene_loss)
+                    loss = loss + float(args.scene_loss_weight) * scene_loss
             scaler.scale(loss).backward()
             if args.grad_clip > 0:
                 scaler.unscale_(optimizer)
@@ -331,15 +491,43 @@ def train(args: argparse.Namespace) -> None:
             scaler.step(optimizer)
             scaler.update()
 
-            pbar.set_postfix({"loss": f"{float(loss.detach().cpu()):.4g}", "step": step})
+            pbar.set_postfix(
+                {
+                    "loss": f"{float(loss.detach().cpu()):.4g}",
+                    "act": f"{float(action_loss.detach().cpu()):.4g}",
+                    "scene": f"{float(scene_loss.detach().cpu()):.4g}",
+                    "step": step,
+                }
+            )
 
             should_eval = args.eval_every > 0 and (step - last_eval >= args.eval_every)
             if should_eval:
                 last_eval = step
                 if test_loader is not None and test_count != 0:
-                    metrics = evaluate(model, test_loader, device, action_mean, action_std, args.eval_batches, args.amp)
+                    metrics = evaluate(
+                        model,
+                        test_loader,
+                        device,
+                        action_mean,
+                        action_std,
+                        args.eval_batches,
+                        args.amp,
+                        scene_metrics=not args.skip_scene_metrics,
+                        scene_cd_max_points=args.scene_cd_max_points,
+                    )
                     metric = metrics["mae"]
-                    print(f"[eval] step={step} mse={metrics['mse']:.6g} mae={metrics['mae']:.6g}", flush=True)
+                    print(
+                        f"[eval] step={step} action_rmse={metrics['rmse']:.6g} action_mae={metrics['mae']:.6g} "
+                        f"scene_rmse_cm={metrics['scene_rmse_cm']:.6g} scene_cd_cm={metrics['scene_cd_cm']:.6g}",
+                        flush=True,
+                    )
+                    write_report(
+                        Path(args.output_dir) / "report-latest.md",
+                        step=step,
+                        stage=args.stage,
+                        metrics=metrics,
+                        actuator_note="Actuator head predicts 54-D joint actions; actuator point-cloud CD requires FK and is not computed.",
+                    )
                 else:
                     metric = float(loss.detach().cpu())
                     print(f"[eval skipped] step={step} no test shards; using train loss={metric:.6g} for checkpoint selection", flush=True)
@@ -394,8 +582,29 @@ def train(args: argparse.Namespace) -> None:
                 return
 
     if test_loader is not None and test_count != 0:
-        metrics = evaluate(model, test_loader, device, action_mean, action_std, args.eval_batches, args.amp)
-        print(f"[final eval] mse={metrics['mse']:.6g} mae={metrics['mae']:.6g}", flush=True)
+        metrics = evaluate(
+            model,
+            test_loader,
+            device,
+            action_mean,
+            action_std,
+            args.eval_batches,
+            args.amp,
+            scene_metrics=not args.skip_scene_metrics,
+            scene_cd_max_points=args.scene_cd_max_points,
+        )
+        print(
+            f"[final eval] action_rmse={metrics['rmse']:.6g} action_mae={metrics['mae']:.6g} "
+            f"scene_rmse_cm={metrics['scene_rmse_cm']:.6g} scene_cd_cm={metrics['scene_cd_cm']:.6g}",
+            flush=True,
+        )
+        write_report(
+            Path(args.output_dir) / "report-final.md",
+            step=step,
+            stage=args.stage,
+            metrics=metrics,
+            actuator_note="Actuator head predicts 54-D joint actions; actuator point-cloud CD requires FK and is not computed.",
+        )
     else:
         print("[final eval skipped] no test shards", flush=True)
     save_checkpoint(Path(args.output_dir) / "checkpoint-last.pt", model, optimizer, args, step, args.num_epochs, best_metric, action_mean, action_std)
@@ -409,7 +618,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--pretrained-checkpoint", default="pretrained_checkpoints/large-droid+behavior/model-best.pt")
     p.add_argument("--resume", default=None, help="Resume from a robotwin2g action checkpoint")
     p.add_argument("--output-dir", required=True)
-    p.add_argument("--stage", choices=["action_decoder", "all"], default="action_decoder")
+    p.add_argument("--stage", choices=["action_decoder", "lora", "all"], default="action_decoder")
     p.add_argument("--reset-optimizer", action="store_true")
 
     p.add_argument("--device", default="auto")
@@ -422,6 +631,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--unfreeze-dinov3", action="store_true")
 
     p.add_argument("--clip-horizon", type=int, default=11)
+    p.add_argument("--action-dim", type=int, default=-1, help="Optional expected action dimension; use 54 for FlowAM dexterous data.")
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--eval-num-workers", type=int, default=2)
@@ -430,6 +640,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--max-steps", type=int, default=-1)
     p.add_argument("--eval-every", type=int, default=500)
     p.add_argument("--eval-batches", type=int, default=20)
+    p.add_argument("--skip-scene-metrics", action="store_true")
+    p.add_argument("--scene-cd-max-points", type=int, default=1024)
     p.add_argument("--allow-empty-test", dest="allow_empty_test", action="store_true", default=True, help="Do not crash when the episode-level split has no test shards; useful for one-episode smoke tests.")
     p.add_argument("--require-test", dest="allow_empty_test", action="store_false", help="Crash if the test split has no shards.")
     p.add_argument("--save-every", type=int, default=2000)
@@ -439,8 +651,20 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--weight-decay", type=float, default=1e-2)
     p.add_argument("--grad-clip", type=float, default=5.0)
     p.add_argument("--loss", choices=["mse", "l1", "smooth_l1"], default="smooth_l1")
+    p.add_argument("--scene-loss", choices=["mse", "l1", "smooth_l1"], default="smooth_l1")
+    p.add_argument("--scene-loss-weight", type=float, default=0.0)
     p.add_argument("--decoder-hidden-dim", type=int, default=512)
     p.add_argument("--decoder-layers", type=int, default=3)
+    p.add_argument("--lora-rank", type=int, default=0)
+    p.add_argument("--lora-alpha", type=float, default=16.0)
+    p.add_argument("--lora-dropout", type=float, default=0.0)
+    p.add_argument(
+        "--lora-targets",
+        default="",
+        help="Comma-separated substrings for Linear modules to adapt. Empty means all PointWorld Linear modules.",
+    )
+    p.add_argument("--lora-exclude", default="", help="Comma-separated substrings to exclude from LoRA.")
+    p.add_argument("--lora-include-dinov3", action="store_true")
     p.add_argument("--amp", action="store_true")
     p.add_argument("--seed", type=int, default=42)
     return p

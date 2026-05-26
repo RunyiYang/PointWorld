@@ -94,6 +94,17 @@ def _load_model(args: argparse.Namespace) -> Tuple[PointWorldActionModel, torch.
         decoder_layers=int(ckpt_args.get("decoder_layers", args.decoder_layers)),
     )
 
+    if int(ckpt_args.get("lora_rank", 0)) > 0:
+        names = model.enable_lora(
+            rank=int(ckpt_args.get("lora_rank", 0)),
+            alpha=float(ckpt_args.get("lora_alpha", 16.0)),
+            dropout=float(ckpt_args.get("lora_dropout", 0.0)),
+            target_patterns=[p for p in str(ckpt_args.get("lora_targets", "")).split(",") if p],
+            exclude_patterns=[p for p in str(ckpt_args.get("lora_exclude", "")).split(",") if p],
+            include_dinov3=bool(ckpt_args.get("lora_include_dinov3", False)),
+        )
+        print(f"[lora] injected {len(names)} adapters for checkpoint load", flush=True)
+
     if pretrained_payload is not None:
         missing, unexpected = model.load_pointworld_checkpoint(pretrained_payload, strict=False)
         print(f"[pretrained] loaded PointWorld: missing={len(missing)} unexpected={len(unexpected)}", flush=True)

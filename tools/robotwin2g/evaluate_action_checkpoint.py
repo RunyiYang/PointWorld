@@ -50,9 +50,19 @@ def _evaluate_one(args: argparse.Namespace, checkpoint: str) -> Dict[str, Any]:
         collate_fn=robotwin_action_collate,
         persistent_workers=args.num_workers > 0,
     )
-    metrics = evaluate(model, loader, device, action_mean, action_std, args.max_batches, args.amp)
+    metrics = evaluate(
+        model,
+        loader,
+        device,
+        action_mean,
+        action_std,
+        args.max_batches,
+        args.amp,
+        scene_metrics=not args.skip_scene_metrics,
+        scene_cd_max_points=args.scene_cd_max_points,
+    )
     count = read_metadata_count(args.wds_root, args.split)
-    return {
+    result = {
         "checkpoint": str(checkpoint),
         "step": int(payload.get("step", -1)),
         "epoch": int(payload.get("epoch", -1)),
@@ -61,9 +71,9 @@ def _evaluate_one(args: argparse.Namespace, checkpoint: str) -> Dict[str, Any]:
         "metadata_count": int(count),
         "max_batches": int(args.max_batches),
         "batch_size": int(args.batch_size),
-        "mse": float(metrics["mse"]),
-        "mae": float(metrics["mae"]),
     }
+    result.update({k: float(v) for k, v in metrics.items()})
+    return result
 
 
 def main() -> None:
@@ -85,7 +95,9 @@ def main() -> None:
         json.dump(payload, fp, indent=2)
     for item in results:
         print(
-            f"[result] step={item['step']} mae={item['mae']:.8f} mse={item['mse']:.8f} "
+            f"[result] step={item['step']} action_rmse={item['rmse']:.8f} action_mae={item['mae']:.8f} "
+            f"scene_rmse_cm={item.get('scene_rmse_cm', float('nan')):.8f} "
+            f"scene_cd_cm={item.get('scene_cd_cm', float('nan')):.8f} "
             f"checkpoint={item['checkpoint']}",
             flush=True,
         )
@@ -101,6 +113,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--max-batches", type=int, default=0, help="0 means full split")
+    p.add_argument("--skip-scene-metrics", action="store_true")
+    p.add_argument("--scene-cd-max-points", type=int, default=1024)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", default="auto")
     p.add_argument("--amp", action="store_true")
