@@ -46,6 +46,14 @@ sbatch scripts/flowam_sbatch_2stage.sh
 ```
 
 Training writes `report-latest.md/json` during evaluation and
-`report-final.md/json` at the end of each stage. Scene RMSE/CD are reported in
-centimeters. Actuator RMSE is the raw 54-D joint-action RMSE; actuator
-point-cloud CD needs FK/surface points and is reported as unavailable.
+`report-final.md/json` at the end of each stage. The FlowAM scripts now default
+to 40 epochs per stage, and stage 2 resets training progress counters after
+loading stage-1 weights so LoRA gets a full training budget.
+
+The primary report fields are `action_rmse_cm`, `action_cd_cm`,
+`scene_rmse_cm`, and `scene_cd_cm`, averaged per scene and reported in
+centimeters. For the 54-D FlowAM action vector, the default action CD/RMSE mode
+uses the nearest observed robot pointcloud frame in normalized action space and
+computes the pointcloud metric on robot surface points. The raw mixed-unit
+54-D action-vector errors are still written as `action_vector_rmse` and
+`action_vector_mae`.

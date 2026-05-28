@@ -36,10 +36,12 @@ python tools/robotwin2g/train_robotwin_action.py \
   --action-dim 54 \
   --batch-size "${STAGE1_BATCH_SIZE:-8}" \
   --num-workers "${NUM_WORKERS:-4}" \
-  --num-epochs "${STAGE1_NUM_EPOCHS:-20}" \
+  --num-epochs "${STAGE1_NUM_EPOCHS:-40}" \
+  --max-steps "${STAGE1_MAX_STEPS:--1}" \
   --lr "${STAGE1_LR:-1e-4}" \
   --eval-every "${EVAL_EVERY:-500}" \
   --eval-batches "${EVAL_BATCHES:-20}" \
+  --action-metric-layout "${ACTION_METRIC_LAYOUT:-robot_flow_nn}" \
   --require-test \
   --amp
 
@@ -52,6 +54,7 @@ python tools/robotwin2g/train_robotwin_action.py \
   --output-dir "${STAGE2_OUT}" \
   --stage lora \
   --reset-optimizer \
+  --reset-progress \
   --action-dim 54 \
   --lora-rank "${LORA_RANK:-8}" \
   --lora-alpha "${LORA_ALPHA:-16}" \
@@ -60,11 +63,13 @@ python tools/robotwin2g/train_robotwin_action.py \
   --scene-cd-max-points "${SCENE_CD_MAX_POINTS:-1024}" \
   --batch-size "${STAGE2_BATCH_SIZE:-4}" \
   --num-workers "${NUM_WORKERS:-4}" \
-  --num-epochs "${STAGE2_NUM_EPOCHS:-20}" \
+  --num-epochs "${STAGE2_NUM_EPOCHS:-40}" \
+  --max-steps "${STAGE2_MAX_STEPS:--1}" \
   --lr "${STAGE2_LR:-1e-4}" \
   --world-lr "${WORLD_LR:-2e-5}" \
   --eval-every "${EVAL_EVERY:-500}" \
   --eval-batches "${EVAL_BATCHES:-20}" \
+  --action-metric-layout "${ACTION_METRIC_LAYOUT:-robot_flow_nn}" \
   --require-test \
   --amp
 

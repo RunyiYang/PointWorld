@@ -37,6 +37,7 @@ python tools/robotwin2g/train_robotwin_action.py \
   --output-dir "${OUT}" \
   --stage lora \
   --reset-optimizer \
+  --reset-progress \
   --action-dim 54 \
   --lora-rank "${LORA_RANK:-8}" \
   --lora-alpha "${LORA_ALPHA:-16}" \
@@ -45,11 +46,13 @@ python tools/robotwin2g/train_robotwin_action.py \
   --scene-cd-max-points "${SCENE_CD_MAX_POINTS:-1024}" \
   --batch-size "${BATCH_SIZE:-4}" \
   --num-workers "${NUM_WORKERS:-4}" \
-  --num-epochs "${NUM_EPOCHS:-20}" \
+  --num-epochs "${NUM_EPOCHS:-40}" \
+  --max-steps "${MAX_STEPS:--1}" \
   --lr "${LR:-1e-4}" \
   --world-lr "${WORLD_LR:-2e-5}" \
   --eval-every "${EVAL_EVERY:-500}" \
   --eval-batches "${EVAL_BATCHES:-20}" \
+  --action-metric-layout "${ACTION_METRIC_LAYOUT:-robot_flow_nn}" \
   --require-test \
   --amp
 

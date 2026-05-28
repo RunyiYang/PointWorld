@@ -119,6 +119,21 @@ def _point_rmse_cm(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor)
     return float((rmse_m * 100.0).detach().cpu()), float(count.detach().cpu())
 
 
+def _point_rmse_cm_per_scene(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> Tuple[float, int]:
+    total = 0.0
+    count = 0
+    diff2 = (pred - target).pow(2).sum(dim=-1) * mask.to(pred.dtype)
+    valid = mask.to(pred.dtype).sum(dim=tuple(range(1, mask.ndim)))
+    err = diff2.sum(dim=tuple(range(1, diff2.ndim)))
+    for b in range(pred.shape[0]):
+        if valid[b] <= 0:
+            continue
+        rmse_m = torch.sqrt(err[b] / valid[b].clamp(min=1.0))
+        total += float((rmse_m * 100.0).detach().cpu())
+        count += 1
+    return total, count
+
+
 def _select_valid_points(points: torch.Tensor, mask: torch.Tensor, max_points: int) -> torch.Tensor:
     pts = points[mask]
     if pts.numel() == 0:
@@ -127,6 +142,23 @@ def _select_valid_points(points: torch.Tensor, mask: torch.Tensor, max_points: i
         idx = torch.linspace(0, pts.shape[0] - 1, steps=max_points, device=pts.device).long()
         pts = pts[idx]
     return pts.float()
+
+
+def _chamfer_points_cm(
+    pred_points: torch.Tensor,
+    target_points: torch.Tensor,
+    pred_mask: torch.Tensor,
+    target_mask: torch.Tensor,
+    *,
+    max_points: int,
+) -> Optional[float]:
+    pred_pts = _select_valid_points(pred_points, pred_mask, max_points)
+    tgt_pts = _select_valid_points(target_points, target_mask, max_points)
+    if pred_pts.shape[0] == 0 or tgt_pts.shape[0] == 0:
+        return None
+    d = torch.cdist(pred_pts.unsqueeze(0), tgt_pts.unsqueeze(0), p=2).squeeze(0)
+    cd_m = 0.5 * (d.min(dim=1).values.mean() + d.min(dim=0).values.mean())
+    return float((cd_m * 100.0).detach().cpu())
 
 
 def _chamfer_cm(
@@ -141,15 +173,156 @@ def _chamfer_cm(
     B, T = pred.shape[:2]
     for b in range(B):
         for t in range(T):
-            pred_pts = _select_valid_points(pred[b, t], mask[b, t], max_points)
-            tgt_pts = _select_valid_points(target[b, t], mask[b, t], max_points)
-            if pred_pts.shape[0] == 0 or tgt_pts.shape[0] == 0:
+            cd_cm = _chamfer_points_cm(pred[b, t], target[b, t], mask[b, t], mask[b, t], max_points=max_points)
+            if cd_cm is None:
                 continue
-            d = torch.cdist(pred_pts.unsqueeze(0), tgt_pts.unsqueeze(0), p=2).squeeze(0)
-            cd_m = 0.5 * (d.min(dim=1).values.mean() + d.min(dim=0).values.mean())
-            total += float((cd_m * 100.0).detach().cpu())
+            total += cd_cm
             count += 1
     return total, count
+
+
+def _chamfer_cm_per_scene(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    max_points: int,
+) -> Tuple[float, int]:
+    total = 0.0
+    count = 0
+    B, T = pred.shape[:2]
+    for b in range(B):
+        frame_vals = []
+        for t in range(T):
+            cd_cm = _chamfer_points_cm(pred[b, t], target[b, t], mask[b, t], mask[b, t], max_points=max_points)
+            if cd_cm is not None:
+                frame_vals.append(cd_cm)
+        if frame_vals:
+            total += sum(frame_vals) / len(frame_vals)
+            count += 1
+    return total, count
+
+
+def _match_last_dim(x: torch.Tensor, dim: int) -> torch.Tensor:
+    if x.shape[-1] > dim:
+        return x[..., :dim]
+    if x.shape[-1] < dim:
+        return F.pad(x, (0, dim - x.shape[-1]))
+    return x
+
+
+def _normalize_action(x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+    dim = x.shape[-1]
+    mean = _match_last_dim(mean, dim).to(device=x.device, dtype=x.dtype)
+    std = _match_last_dim(std, dim).to(device=x.device, dtype=x.dtype).clamp(min=1e-6)
+    return (x - mean.view(*([1] * (x.ndim - 1)), dim)) / std.view(*([1] * (x.ndim - 1)), dim)
+
+
+def _action_robot_flow_nn_metrics_cm(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    action_state: torch.Tensor,
+    robot_flows: torch.Tensor,
+    robot_exists: torch.Tensor,
+    mask: torch.Tensor,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    *,
+    max_points: int,
+) -> Tuple[float, int, float, int]:
+    pred_norm = _normalize_action(pred.float(), mean, std)
+    target_norm = _normalize_action(target.float(), mean, std)
+    state_norm = _normalize_action(_match_last_dim(action_state.float(), pred.shape[-1]), mean, std)
+
+    rmse_total = 0.0
+    cd_total = 0.0
+    rmse_count = 0
+    cd_count = 0
+    B, H = pred.shape[:2]
+    for b in range(B):
+        rmse_vals = []
+        cd_vals = []
+        state_b = state_norm[b]
+        for h in range(H):
+            if not bool(mask[b, h].detach().cpu()):
+                continue
+            pred_dist = (state_b - pred_norm[b, h].view(1, -1)).pow(2).mean(dim=-1)
+            target_dist = (state_b - target_norm[b, h].view(1, -1)).pow(2).mean(dim=-1)
+            pred_idx = int(pred_dist.argmin().detach().cpu())
+            target_idx = int(target_dist.argmin().detach().cpu())
+            pred_mask = robot_exists[b, pred_idx].bool()
+            target_mask = robot_exists[b, target_idx].bool()
+            common_mask = pred_mask & target_mask
+            if common_mask.any():
+                rmse_cm, _ = _point_rmse_cm(
+                    robot_flows[b, pred_idx].unsqueeze(0).unsqueeze(0),
+                    robot_flows[b, target_idx].unsqueeze(0).unsqueeze(0),
+                    common_mask.unsqueeze(0).unsqueeze(0),
+                )
+                rmse_vals.append(rmse_cm)
+            cd_cm = _chamfer_points_cm(
+                robot_flows[b, pred_idx],
+                robot_flows[b, target_idx],
+                pred_mask,
+                target_mask,
+                max_points=max_points,
+            )
+            if cd_cm is not None:
+                cd_vals.append(cd_cm)
+        if rmse_vals:
+            rmse_total += sum(rmse_vals) / len(rmse_vals)
+            rmse_count += 1
+        if cd_vals:
+            cd_total += sum(cd_vals) / len(cd_vals)
+            cd_count += 1
+    return rmse_total, rmse_count, cd_total, cd_count
+
+
+def _action_point_metrics_cm(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    batch: Dict[str, torch.Tensor],
+    mask: torch.Tensor,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    *,
+    layout: str,
+    max_points: int,
+) -> Tuple[float, int, float, int]:
+    if layout == "none":
+        return 0.0, 0, 0.0, 0
+    if layout == "robot_flow_nn":
+        return _action_robot_flow_nn_metrics_cm(
+            pred,
+            target,
+            batch["action_state"],
+            batch["robot_flows"].float(),
+            batch["robot_exists"].bool(),
+            mask,
+            mean,
+            std,
+            max_points=max_points,
+        )
+    if layout == "two_gripper_xyz":
+        if pred.shape[-1] < 10:
+            return 0.0, 0, 0.0, 0
+        pred_pts = pred[..., [0, 1, 2, 7, 8, 9]].reshape(pred.shape[0], pred.shape[1], 2, 3)
+        target_pts = target[..., [0, 1, 2, 7, 8, 9]].reshape(target.shape[0], target.shape[1], 2, 3)
+        point_mask = mask.bool().unsqueeze(-1).expand(pred.shape[0], pred.shape[1], 2)
+        rmse_sum, rmse_count = _point_rmse_cm_per_scene(pred_pts, target_pts, point_mask)
+        cd_sum, cd_count = _chamfer_cm_per_scene(pred_pts, target_pts, point_mask, max_points=max_points)
+        return rmse_sum, rmse_count, cd_sum, cd_count
+    if layout != "xyz_points":
+        raise ValueError(f"Unsupported action metric layout {layout}")
+    if pred.shape[-1] % 3 != 0:
+        return 0.0, 0, 0.0, 0
+    num_points = pred.shape[-1] // 3
+    pred_pts = pred.reshape(pred.shape[0], pred.shape[1], num_points, 3)
+    target_pts = target.reshape(target.shape[0], target.shape[1], num_points, 3)
+    point_mask = mask.bool().unsqueeze(-1).expand(pred.shape[0], pred.shape[1], num_points)
+    rmse_sum, rmse_count = _point_rmse_cm_per_scene(pred_pts, target_pts, point_mask)
+    cd_sum, cd_count = _chamfer_cm_per_scene(pred_pts, target_pts, point_mask, max_points=max_points)
+    return rmse_sum, rmse_count, cd_sum, cd_count
 
 
 @torch.no_grad()
@@ -163,13 +336,19 @@ def evaluate(
     amp: bool,
     scene_metrics: bool = True,
     scene_cd_max_points: int = 1024,
+    action_metric_layout: str = "none",
+    action_cd_max_points: int = 1024,
 ) -> Dict[str, float]:
     model.eval()
     total_mse = 0.0
     total_mae = 0.0
     total_count = 0.0
-    scene_rmse_weighted = 0.0
-    scene_rmse_count = 0.0
+    action_rmse_cm_sum = 0.0
+    action_rmse_cm_count = 0
+    action_cd_cm_sum = 0.0
+    action_cd_cm_count = 0
+    scene_rmse_sum = 0.0
+    scene_rmse_count = 0
     scene_cd_sum = 0.0
     scene_cd_count = 0
     for i, batch in enumerate(loader):
@@ -184,14 +363,29 @@ def evaluate(
                 scene_outputs = None
         pred = pred_norm.float() * std.view(1, 1, -1) + mean.view(1, 1, -1)
         target = batch["action_target"].float()
-        mask = batch["action_mask"].bool()
-        while mask.ndim < pred.ndim:
-            mask = mask.unsqueeze(-1)
-        diff = (pred - target) * mask.to(pred.dtype)
-        denom = (mask.to(pred.dtype).sum() * pred.shape[-1]).clamp(min=1.0)
+        action_mask = batch["action_mask"].bool()
+        action_feature_mask = action_mask
+        while action_feature_mask.ndim < pred.ndim:
+            action_feature_mask = action_feature_mask.unsqueeze(-1)
+        diff = (pred - target) * action_feature_mask.to(pred.dtype)
+        denom = (action_feature_mask.to(pred.dtype).sum() * pred.shape[-1]).clamp(min=1.0)
         total_mse += float(diff.pow(2).sum().item())
         total_mae += float(diff.abs().sum().item())
         total_count += float(denom.item())
+        action_rmse_sum, action_rmse_count, action_cd_sum, action_cd_count = _action_point_metrics_cm(
+            pred,
+            target,
+            batch,
+            action_mask,
+            mean,
+            std,
+            layout=action_metric_layout,
+            max_points=action_cd_max_points,
+        )
+        action_rmse_cm_sum += action_rmse_sum
+        action_rmse_cm_count += action_rmse_count
+        action_cd_cm_sum += action_cd_sum
+        action_cd_cm_count += action_cd_count
         if scene_outputs is not None:
             scene_pred = scene_outputs["scene_flows"].float()[:, 1:]
             scene_target = batch["scene_flows"].float()[:, 1:]
@@ -200,10 +394,10 @@ def evaluate(
                 scene_mask = scene_mask & batch["scene_visibility"].bool()[:, 1:]
             if "scene_depth_valid_mask" in batch:
                 scene_mask = scene_mask & batch["scene_depth_valid_mask"].bool()[:, 1:]
-            rmse_cm, rmse_count = _point_rmse_cm(scene_pred, scene_target, scene_mask)
-            scene_rmse_weighted += rmse_cm * rmse_count
+            rmse_sum, rmse_count = _point_rmse_cm_per_scene(scene_pred, scene_target, scene_mask)
+            scene_rmse_sum += rmse_sum
             scene_rmse_count += rmse_count
-            cd_sum, cd_count = _chamfer_cm(scene_pred, scene_target, scene_mask, max_points=scene_cd_max_points)
+            cd_sum, cd_count = _chamfer_cm_per_scene(scene_pred, scene_target, scene_mask, max_points=scene_cd_max_points)
             scene_cd_sum += cd_sum
             scene_cd_count += cd_count
     if total_count <= 0:
@@ -211,20 +405,44 @@ def evaluate(
     else:
         mse = total_mse / total_count
         out = {"mse": mse, "mae": total_mae / total_count, "rmse": math.sqrt(max(mse, 0.0))}
-    out["scene_rmse_cm"] = scene_rmse_weighted / scene_rmse_count if scene_rmse_count > 0 else float("nan")
+    out["action_vector_rmse"] = out["rmse"]
+    out["action_vector_mae"] = out["mae"]
+    out["action_rmse_cm"] = action_rmse_cm_sum / action_rmse_cm_count if action_rmse_cm_count > 0 else float("nan")
+    out["action_cd_cm"] = action_cd_cm_sum / action_cd_cm_count if action_cd_cm_count > 0 else float("nan")
+    out["scene_rmse_cm"] = scene_rmse_sum / scene_rmse_count if scene_rmse_count > 0 else float("nan")
     out["scene_cd_cm"] = scene_cd_sum / scene_cd_count if scene_cd_count > 0 else float("nan")
-    out["actuator_rmse"] = out["rmse"]
-    out["actuator_cd_cm"] = float("nan")
+    out["action_rmse"] = out["action_rmse_cm"]
+    out["action_cd"] = out["action_cd_cm"]
+    out["scene_rmse"] = out["scene_rmse_cm"]
+    out["scene_cd"] = out["scene_cd_cm"]
+    out["actuator_rmse"] = out["action_vector_rmse"]
+    out["actuator_cd_cm"] = out["action_cd_cm"]
     return out
 
 
-def write_report(path: Path, *, step: int, stage: str, metrics: Dict[str, float], actuator_note: str) -> None:
+def _fmt_metric(value: float, suffix: str = "") -> str:
+    if value is None or not math.isfinite(float(value)):
+        return "N/A"
+    return f"{float(value):.6g}{suffix}"
+
+
+def _action_metric_note(layout: str) -> str:
+    if layout == "robot_flow_nn":
+        return "Action RMSE/CD are computed per scene on robot pointclouds by selecting the nearest observed robot frame in normalized action space, then converting point distances to centimeters."
+    if layout == "xyz_points":
+        return "Action RMSE/CD are computed per scene after reshaping action vectors into XYZ triples in meters and converting to centimeters."
+    if layout == "two_gripper_xyz":
+        return "Action RMSE/CD are computed from the left/right gripper XYZ action slots [0:3] and [7:10] in meters, converted to centimeters."
+    return "Action RMSE/CD in centimeters are not computed because the action vector is not declared as spatial XYZ triples."
+
+
+def write_report(path: Path, *, step: int, stage: str, metrics: Dict[str, float], action_metric_note: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "step": int(step),
         "stage": stage,
         "metrics": metrics,
-        "actuator_note": actuator_note,
+        "action_metric_note": action_metric_note,
     }
     with open(path.with_suffix(".json"), "w") as fp:
         json.dump(payload, fp, indent=2, sort_keys=True)
@@ -236,10 +454,11 @@ def write_report(path: Path, *, step: int, stage: str, metrics: Dict[str, float]
         "",
         "| Target | RMSE ↓ | CD (cm) ↓ |",
         "|---|---:|---:|",
-        f"| Actuator action (54-D) | {metrics.get('actuator_rmse', float('nan')):.6g} raw | N/A |",
-        f"| Scene | {metrics.get('scene_rmse_cm', float('nan')):.6g} cm | {metrics.get('scene_cd_cm', float('nan')):.6g} |",
+        f"| Action | {_fmt_metric(metrics.get('action_rmse_cm', float('nan')), ' cm')} | {_fmt_metric(metrics.get('action_cd_cm', float('nan')))} |",
+        f"| Scene | {_fmt_metric(metrics.get('scene_rmse_cm', float('nan')), ' cm')} | {_fmt_metric(metrics.get('scene_cd_cm', float('nan')))} |",
         "",
-        f"Actuator note: {actuator_note}",
+        f"Action metric note: {action_metric_note}",
+        f"Raw 54-D action vector RMSE: {_fmt_metric(metrics.get('action_vector_rmse', float('nan')))}",
     ]
     path.write_text("\n".join(lines) + "\n")
 
@@ -441,6 +660,15 @@ def train(args: argparse.Namespace) -> None:
     best_metric = float("inf")
     if args.resume:
         start_step, start_epoch, best_metric = load_resume(args.resume, model, optimizer=None if args.reset_optimizer else optimizer, strict=False)
+        if args.reset_progress:
+            print(
+                f"[resume] reset progress counters from loaded step={start_step} epoch={start_epoch} "
+                "for a fresh training stage",
+                flush=True,
+            )
+            start_step = 0
+            start_epoch = 0
+            best_metric = float("inf")
         # Apply the requested training stage after loading, because resume state may come from a different stage.
         model.set_train_stage(args.stage, unfreeze_dinov3=args.unfreeze_dinov3)
         print(f"[resume] step={start_step} epoch={start_epoch} best_metric={best_metric}", flush=True)
@@ -514,11 +742,18 @@ def train(args: argparse.Namespace) -> None:
                         args.amp,
                         scene_metrics=not args.skip_scene_metrics,
                         scene_cd_max_points=args.scene_cd_max_points,
+                        action_metric_layout=args.action_metric_layout,
+                        action_cd_max_points=args.action_cd_max_points,
                     )
                     metric = metrics["mae"]
                     print(
-                        f"[eval] step={step} action_rmse={metrics['rmse']:.6g} action_mae={metrics['mae']:.6g} "
-                        f"scene_rmse_cm={metrics['scene_rmse_cm']:.6g} scene_cd_cm={metrics['scene_cd_cm']:.6g}",
+                        f"[eval] step={step} "
+                        f"action_rmse_cm={_fmt_metric(metrics['action_rmse_cm'])} "
+                        f"action_cd_cm={_fmt_metric(metrics['action_cd_cm'])} "
+                        f"scene_rmse_cm={_fmt_metric(metrics['scene_rmse_cm'])} "
+                        f"scene_cd_cm={_fmt_metric(metrics['scene_cd_cm'])} "
+                        f"action_vector_rmse={metrics['action_vector_rmse']:.6g} "
+                        f"action_vector_mae={metrics['action_vector_mae']:.6g}",
                         flush=True,
                     )
                     write_report(
@@ -526,7 +761,7 @@ def train(args: argparse.Namespace) -> None:
                         step=step,
                         stage=args.stage,
                         metrics=metrics,
-                        actuator_note="Actuator head predicts 54-D joint actions; actuator point-cloud CD requires FK and is not computed.",
+                        action_metric_note=_action_metric_note(args.action_metric_layout),
                     )
                 else:
                     metric = float(loss.detach().cpu())
@@ -592,10 +827,16 @@ def train(args: argparse.Namespace) -> None:
             args.amp,
             scene_metrics=not args.skip_scene_metrics,
             scene_cd_max_points=args.scene_cd_max_points,
+            action_metric_layout=args.action_metric_layout,
+            action_cd_max_points=args.action_cd_max_points,
         )
         print(
-            f"[final eval] action_rmse={metrics['rmse']:.6g} action_mae={metrics['mae']:.6g} "
-            f"scene_rmse_cm={metrics['scene_rmse_cm']:.6g} scene_cd_cm={metrics['scene_cd_cm']:.6g}",
+            f"[final eval] action_rmse_cm={_fmt_metric(metrics['action_rmse_cm'])} "
+            f"action_cd_cm={_fmt_metric(metrics['action_cd_cm'])} "
+            f"scene_rmse_cm={_fmt_metric(metrics['scene_rmse_cm'])} "
+            f"scene_cd_cm={_fmt_metric(metrics['scene_cd_cm'])} "
+            f"action_vector_rmse={metrics['action_vector_rmse']:.6g} "
+            f"action_vector_mae={metrics['action_vector_mae']:.6g}",
             flush=True,
         )
         write_report(
@@ -603,7 +844,7 @@ def train(args: argparse.Namespace) -> None:
             step=step,
             stage=args.stage,
             metrics=metrics,
-            actuator_note="Actuator head predicts 54-D joint actions; actuator point-cloud CD requires FK and is not computed.",
+            action_metric_note=_action_metric_note(args.action_metric_layout),
         )
     else:
         print("[final eval skipped] no test shards", flush=True)
@@ -620,6 +861,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--output-dir", required=True)
     p.add_argument("--stage", choices=["action_decoder", "lora", "all"], default="action_decoder")
     p.add_argument("--reset-optimizer", action="store_true")
+    p.add_argument("--reset-progress", action="store_true", help="Load resume weights but restart step/epoch/best-metric counters; useful when starting a new training stage.")
 
     p.add_argument("--device", default="auto")
     p.add_argument("--norm-stats-path", default="stats/droid_behavior")
@@ -642,6 +884,13 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--eval-batches", type=int, default=20)
     p.add_argument("--skip-scene-metrics", action="store_true")
     p.add_argument("--scene-cd-max-points", type=int, default=1024)
+    p.add_argument(
+        "--action-metric-layout",
+        choices=["none", "xyz_points", "robot_flow_nn", "two_gripper_xyz"],
+        default="none",
+        help="How to compute action_rmse_cm/action_cd_cm. Use two_gripper_xyz for 14-D [left7,right7] actions, xyz_points for XYZ triples, or robot_flow_nn as a FlowAM proxy.",
+    )
+    p.add_argument("--action-cd-max-points", type=int, default=1024)
     p.add_argument("--allow-empty-test", dest="allow_empty_test", action="store_true", default=True, help="Do not crash when the episode-level split has no test shards; useful for one-episode smoke tests.")
     p.add_argument("--require-test", dest="allow_empty_test", action="store_false", help="Crash if the test split has no shards.")
     p.add_argument("--save-every", type=int, default=2000)

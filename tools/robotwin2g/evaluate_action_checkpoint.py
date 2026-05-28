@@ -60,6 +60,8 @@ def _evaluate_one(args: argparse.Namespace, checkpoint: str) -> Dict[str, Any]:
         args.amp,
         scene_metrics=not args.skip_scene_metrics,
         scene_cd_max_points=args.scene_cd_max_points,
+        action_metric_layout=args.action_metric_layout,
+        action_cd_max_points=args.action_cd_max_points,
     )
     count = read_metadata_count(args.wds_root, args.split)
     result = {
@@ -95,9 +97,13 @@ def main() -> None:
         json.dump(payload, fp, indent=2)
     for item in results:
         print(
-            f"[result] step={item['step']} action_rmse={item['rmse']:.8f} action_mae={item['mae']:.8f} "
+            f"[result] step={item['step']} "
+            f"action_rmse_cm={item.get('action_rmse_cm', float('nan')):.8f} "
+            f"action_cd_cm={item.get('action_cd_cm', float('nan')):.8f} "
             f"scene_rmse_cm={item.get('scene_rmse_cm', float('nan')):.8f} "
             f"scene_cd_cm={item.get('scene_cd_cm', float('nan')):.8f} "
+            f"action_vector_rmse={item.get('action_vector_rmse', item.get('rmse', float('nan'))):.8f} "
+            f"action_vector_mae={item.get('action_vector_mae', item.get('mae', float('nan'))):.8f} "
             f"checkpoint={item['checkpoint']}",
             flush=True,
         )
@@ -115,6 +121,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--max-batches", type=int, default=0, help="0 means full split")
     p.add_argument("--skip-scene-metrics", action="store_true")
     p.add_argument("--scene-cd-max-points", type=int, default=1024)
+    p.add_argument("--action-metric-layout", choices=["none", "xyz_points", "robot_flow_nn", "two_gripper_xyz"], default="none")
+    p.add_argument("--action-cd-max-points", type=int, default=1024)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", default="auto")
     p.add_argument("--amp", action="store_true")

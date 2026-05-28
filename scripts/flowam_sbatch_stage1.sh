@@ -35,10 +35,12 @@ python tools/robotwin2g/train_robotwin_action.py \
   --action-dim 54 \
   --batch-size "${BATCH_SIZE:-8}" \
   --num-workers "${NUM_WORKERS:-4}" \
-  --num-epochs "${NUM_EPOCHS:-20}" \
+  --num-epochs "${NUM_EPOCHS:-40}" \
+  --max-steps "${MAX_STEPS:--1}" \
   --lr "${LR:-1e-4}" \
   --eval-every "${EVAL_EVERY:-500}" \
   --eval-batches "${EVAL_BATCHES:-20}" \
+  --action-metric-layout "${ACTION_METRIC_LAYOUT:-robot_flow_nn}" \
   --require-test \
   --amp
 

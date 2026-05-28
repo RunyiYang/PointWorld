@@ -143,6 +143,30 @@ def _maybe_read_matrix(f: h5py.File, keys: Sequence[str], shape: Tuple[int, ...]
     return None
 
 
+def _read_endpose(f: h5py.File, key: Optional[str]) -> Optional[np.ndarray]:
+    if not key:
+        return None
+    key = key.strip("/")
+    if key not in f:
+        return None
+    obj = f[key]
+    if isinstance(obj, h5py.Dataset):
+        return np.asarray(obj[()], dtype=np.float32)
+    if not isinstance(obj, h5py.Group):
+        return None
+
+    left_candidates = ["left_endpose", "left_pose", "left", "left_gripper_pose"]
+    right_candidates = ["right_endpose", "right_pose", "right", "right_gripper_pose"]
+    left = next((np.asarray(obj[name][()], dtype=np.float32) for name in left_candidates if name in obj), None)
+    right = next((np.asarray(obj[name][()], dtype=np.float32) for name in right_candidates if name in obj), None)
+    if left is None or right is None:
+        return None
+    if left.ndim != 2 or right.ndim != 2:
+        return None
+    n = min(left.shape[0], right.shape[0])
+    return np.concatenate([left[:n, :7], right[:n, :7]], axis=-1).astype(np.float32)
+
+
 def _to_depth_uint16_mm(depth_m: np.ndarray) -> np.ndarray:
     depth_m = np.asarray(depth_m, dtype=np.float32)
     depth_m = np.nan_to_num(depth_m, nan=0.0, posinf=0.0, neginf=0.0)
@@ -355,7 +379,7 @@ def _write_clip_group(
     action_target = action[frames[1:]].astype(np.float32)
     action_mask = np.ones((horizon - 1,), dtype=np.bool_)
 
-    endpose = h5_read(in_h5, args.endpose_key, default=None) if args.endpose_key else None
+    endpose = _read_endpose(in_h5, args.endpose_key)
     robot_arrays = _robot_surrogate_arrays(endpose, frames, args, hand_qpos, total_len)
 
     # Direct fields preserved by the custom WDS converter and action trainer.
